@@ -311,6 +311,15 @@ def _validate_file_path(file_path: str) -> Optional[str]:
     if has_traversal_component(file_path):
         return "Path traversal ('..') is not allowed."
 
+    # SKILL.md is not a supporting file — steer to the right action instead of
+    # the generic whitelist message, which doesn't reveal the correct path.
+    if normalized.name == "SKILL.md":
+        return (
+            "SKILL.md cannot be written via write_file/remove_file. "
+            "To edit it use action='patch' (targeted, omit file_path — it "
+            "validates frontmatter) or action='edit' (full rewrite)."
+        )
+
     # Must be under an allowed subdirectory
     if not normalized.parts or normalized.parts[0] not in ALLOWED_SUBDIRS:
         allowed = ", ".join(sorted(ALLOWED_SUBDIRS))
