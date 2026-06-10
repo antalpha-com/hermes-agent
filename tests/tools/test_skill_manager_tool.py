@@ -183,6 +183,17 @@ class TestValidateFilePath:
         assert "File must be under one of:" in err
         assert "'malicious.py'" in err
 
+    def test_skill_md_redirected_to_edit_patch(self):
+        # write_file/remove_file must not touch SKILL.md; the error should name
+        # the correct actions instead of the generic whitelist message.
+        err = _validate_file_path("SKILL.md")
+        assert err is not None
+        assert "SKILL.md cannot be written via write_file" in err
+        assert "action='patch'" in err
+        assert "action='edit'" in err
+        # The generic whitelist message must NOT be what the agent sees here.
+        assert "File must be under one of:" not in err
+
 
 # ---------------------------------------------------------------------------
 # CRUD operations

@@ -212,6 +212,49 @@ class TestPatchHandler:
         assert "Unknown mode" in result["error"]
 
 
+class TestSkillMdGuard:
+    """SKILL.md edits via file tools must be redirected to skill_manage."""
+
+    def test_check_flags_skill_md_paths(self):
+        from tools.file_tools import _check_skill_md_path
+        for p in (
+            "/root/.hermes/skills/common-ns-process/SKILL.md",
+            "/home/ec2-user/.hermes/profiles/x/skills/foo/SKILL.md",
+            "skills/foo/SKILL.md",
+        ):
+            err = _check_skill_md_path(p)
+            assert err is not None, p
+            assert "skill_manage" in err
+            assert "action='patch'" in err
+
+    def test_check_allows_non_skill_paths(self):
+        from tools.file_tools import _check_skill_md_path
+        assert _check_skill_md_path("/tmp/f.py") is None
+        # A normal file that merely lives under skills/ is fine.
+        assert _check_skill_md_path("/root/.hermes/skills/foo/references/api.md") is None
+        # SKILL.md outside any skills tree is not our concern.
+        assert _check_skill_md_path("/tmp/SKILL.md") is None
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_write_file_blocks_skill_md_without_calling_ops(self, mock_get):
+        from tools.file_tools import write_file_tool
+        result = json.loads(write_file_tool(
+            "/root/.hermes/skills/foo/SKILL.md", "content", task_id="default"))
+        assert "error" in result
+        assert "skill_manage" in result["error"]
+        mock_get.assert_not_called()
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_patch_blocks_skill_md_without_calling_ops(self, mock_get):
+        from tools.file_tools import patch_tool
+        result = json.loads(patch_tool(
+            mode="replace", path="/root/.hermes/skills/foo/SKILL.md",
+            old_string="a", new_string="b"))
+        assert "error" in result
+        assert "skill_manage" in result["error"]
+        mock_get.assert_not_called()
+
+
 class TestSearchHandler:
     @patch("tools.file_tools._get_file_ops")
     def test_search_calls_file_ops(self, mock_get):

@@ -174,6 +174,32 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     return None
 
 
+def _check_skill_md_path(filepath: str, task_id: str = "default") -> str | None:
+    """Redirect direct SKILL.md edits to the governed skill_manage tool.
+
+    Skills are bind-mounted read-only into sandboxes, so writing SKILL.md via
+    the file tools either fails with 'Read-only file system' or (worse) lands
+    in a throwaway sanitized copy that is discarded when the container dies.
+    Editing a skill definition must go through skill_manage, which runs on the
+    host writable copy, validates frontmatter, and keeps a curator backup.
+    """
+    try:
+        resolved = str(_resolve_path_for_task(filepath, task_id))
+    except (OSError, ValueError):
+        resolved = filepath
+    normalized = os.path.normpath(os.path.expanduser(filepath))
+    for candidate in (resolved, normalized):
+        parts = candidate.replace("\\", "/").split("/")
+        if parts and parts[-1] == "SKILL.md" and "skills" in parts[:-1]:
+            return (
+                "Refusing to edit SKILL.md via file tools — skills are mounted "
+                "read-only in the sandbox. Use the skill_manage tool instead: "
+                "action='patch' (targeted find/replace, omit file_path — it "
+                "validates frontmatter) or action='edit' (full SKILL.md rewrite)."
+            )
+    return None
+
+
 def _is_expected_write_exception(exc: Exception) -> bool:
     """Return True for expected write denials that should not hit error logs."""
     if isinstance(exc, PermissionError):
@@ -791,6 +817,9 @@ def write_file_tool(path: str, content: str, task_id: str = "default") -> str:
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
         return tool_error(sensitive_err)
+    skill_err = _check_skill_md_path(path, task_id)
+    if skill_err:
+        return tool_error(skill_err)
     if _is_internal_file_status_text(content):
         return tool_error(
             "Refusing to write internal read_file status text as file content. "
@@ -859,6 +888,9 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         sensitive_err = _check_sensitive_path(_p, task_id)
         if sensitive_err:
             return tool_error(sensitive_err)
+        skill_err = _check_skill_md_path(_p, task_id)
+        if skill_err:
+            return tool_error(skill_err)
     try:
         # Resolve paths for locking.  Ordered + deduplicated so concurrent
         # callers lock in the same order — prevents deadlock on overlapping
