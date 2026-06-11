@@ -175,6 +175,29 @@ def _float_env(name: str, default: float) -> float:
         return float(default)
 
 
+def _resolve_hygiene_threshold(comp_cfg: Any, default: float = 0.85) -> float:
+    """Resolve the session-hygiene trigger fraction from compression config.
+
+    Reads ``compression.hygiene_threshold`` (the pre-agent safety-net fraction
+    of the context window at which to auto-compress). Falls back to ``default``
+    (0.85) when unset, non-numeric, or out of the open-closed range (0, 1].
+    Lets a deployment fire hygiene earlier — e.g. 0.60 for large-window models
+    where 85% leaves too little headroom before overflow.
+    """
+    if not isinstance(comp_cfg, dict):
+        return float(default)
+    raw = comp_cfg.get("hygiene_threshold")
+    if raw is None:
+        return float(default)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return float(default)
+    if 0 < value <= 1:
+        return value
+    return float(default)
+
+
 def _is_fresh_gateway_interruption(
     value: Any,
     *,
@@ -7492,6 +7515,11 @@ class GatewayRunner:
                                     _hyg_hard_msg_limit = _parsed
                             except (TypeError, ValueError):
                                 pass
+                        # Optional override of the hygiene trigger fraction
+                        # (compression.hygiene_threshold; default 0.85).
+                        _hyg_threshold_pct = _resolve_hygiene_threshold(
+                            _comp_cfg, _hyg_threshold_pct
+                        )
 
                 try:
                     _hyg_model, _hyg_runtime = self._resolve_session_agent_runtime(

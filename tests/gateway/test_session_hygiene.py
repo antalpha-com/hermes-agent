@@ -849,3 +849,33 @@ async def test_session_hygiene_default_hard_message_limit_does_not_fire_at_12_me
     assert FakeCompressAgent.last_instance is None, (
         "Compression should NOT fire at 12 messages with default hard_limit=400"
     )
+
+
+class TestResolveHygieneThreshold:
+    """compression.hygiene_threshold overrides the 0.85 hygiene default."""
+
+    def test_default_when_unset(self):
+        from gateway.run import _resolve_hygiene_threshold
+        assert _resolve_hygiene_threshold({}, 0.85) == 0.85
+
+    def test_valid_override_applied(self):
+        from gateway.run import _resolve_hygiene_threshold
+        assert _resolve_hygiene_threshold({"hygiene_threshold": 0.60}, 0.85) == 0.60
+
+    def test_string_value_coerced(self):
+        from gateway.run import _resolve_hygiene_threshold
+        assert _resolve_hygiene_threshold({"hygiene_threshold": "0.6"}, 0.85) == 0.6
+
+    def test_out_of_range_ignored(self):
+        from gateway.run import _resolve_hygiene_threshold
+        assert _resolve_hygiene_threshold({"hygiene_threshold": 1.5}, 0.85) == 0.85
+        assert _resolve_hygiene_threshold({"hygiene_threshold": 0}, 0.85) == 0.85
+        assert _resolve_hygiene_threshold({"hygiene_threshold": -0.2}, 0.85) == 0.85
+
+    def test_non_numeric_ignored(self):
+        from gateway.run import _resolve_hygiene_threshold
+        assert _resolve_hygiene_threshold({"hygiene_threshold": "abc"}, 0.85) == 0.85
+
+    def test_non_dict_returns_default(self):
+        from gateway.run import _resolve_hygiene_threshold
+        assert _resolve_hygiene_threshold(None, 0.85) == 0.85
