@@ -53,7 +53,7 @@ class WarnCaptureAdapter(BasePlatformAdapter):
     async def disconnect(self): return None
 
     async def send(self, chat_id, content, reply_to=None, metadata=None):
-        self.sent.append({"chat_id": chat_id, "content": content})
+        self.sent.append({"chat_id": chat_id, "content": content, "metadata": metadata})
         return SendResult(success=True, message_id="warn-1")
 
     async def get_chat_info(self, chat_id): return {"id": chat_id}
@@ -68,13 +68,14 @@ def _make_runner(adapter, tmp_path):
     return runner
 
 
-async def _call_warn(runner, entry, agent_result, source):
+async def _call_warn(runner, entry, agent_result, source, event_message_id=None):
     import gateway.run as gr
     await gr._maybe_send_context_warn(
         runner=runner,
         session_entry=entry,
         agent_result=agent_result,
         source=source,
+        event_message_id=event_message_id,
     )
 
 
@@ -202,3 +203,48 @@ def test_warn_reset_after_new_session(tmp_path):
         store.reset_session(entry.session_key)
 
     assert store._entries[entry.session_key].ctx_warn_sent is False
+
+
+def test_warn_routes_to_thread_when_source_has_thread_id(tmp_path):
+    """Warning is sent with thread metadata when source has a thread_id."""
+    import asyncio
+    adapter = WarnCaptureAdapter()
+    runner = _make_runner(adapter, tmp_path)
+
+    # Source with thread_id — simulates user messaging in a Slack thread
+    source = SessionSource(
+        platform=Platform.TELEGRAM, chat_id="chat-1", user_id="u1", thread_id="thread-42"
+    )
+    entry = _make_entry(session_key="sk5", session_id="sid5", ctx_warn_sent=False)
+    runner.session_store._entries["sk5"] = entry
+
+    asyncio.run(_call_warn(
+        runner, entry,
+        {"last_prompt_tokens": 160_000, "context_length": 200_000},
+        source,
+        event_message_id="msg-99",
+    ))
+
+    assert len(adapter.sent) == 1
+    meta = adapter.sent[0].get("metadata") or {}
+    assert meta.get("thread_id") == "thread-42"
+
+
+def test_warn_routes_to_main_channel_when_no_thread(tmp_path):
+    """Warning has no thread metadata when source has no thread_id."""
+    import asyncio
+    adapter = WarnCaptureAdapter()
+    runner = _make_runner(adapter, tmp_path)
+
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat-1", user_id="u1")
+    entry = _make_entry(session_key="sk6", session_id="sid6", ctx_warn_sent=False)
+    runner.session_store._entries["sk6"] = entry
+
+    asyncio.run(_call_warn(
+        runner, entry,
+        {"last_prompt_tokens": 160_000, "context_length": 200_000},
+        source,
+    ))
+
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0].get("metadata") is None

@@ -1208,12 +1208,14 @@ async def _maybe_send_context_warn(
     session_entry,
     agent_result: dict,
     source,
+    event_message_id: Optional[str] = None,
 ) -> None:
     """Send a one-time context-length warning when usage crosses the threshold.
 
     Reads compression.context_warn_pct from config.yaml (default 0.75).
     The flag ctx_warn_sent on session_entry prevents repeated messages within
     the same session; it resets naturally when reset_session() creates a new entry.
+    Replies in the same thread as the triggering message when applicable.
     """
     if session_entry.ctx_warn_sent:
         return
@@ -1243,8 +1245,9 @@ async def _maybe_send_context_warn(
 
     pct_int = int(last_tokens / ctx_length * 100)
     msg = _CTX_WARN_MSG.format(pct=pct_int)
+    thread_meta = runner._thread_metadata_for_source(source, event_message_id)
     try:
-        await adapter.send(source.chat_id, msg)
+        await adapter.send(source.chat_id, msg, metadata=thread_meta)
         runner.session_store.update_session(session_entry.session_key, ctx_warn_sent=True)
         session_entry.ctx_warn_sent = True  # in-memory update so caller sees it
     except Exception as _e:
@@ -8223,6 +8226,7 @@ class GatewayRunner:
                 session_entry=session_entry,
                 agent_result=agent_result,
                 source=source,
+                event_message_id=event_message_id,
             )
 
             # Auto voice reply: send TTS audio before the text response
