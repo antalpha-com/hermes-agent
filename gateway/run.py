@@ -8226,7 +8226,7 @@ class GatewayRunner:
                 session_entry=session_entry,
                 agent_result=agent_result,
                 source=source,
-                event_message_id=event_message_id,
+                event_message_id=self._reply_anchor_for_event(event),
             )
 
             # Auto voice reply: send TTS audio before the text response
