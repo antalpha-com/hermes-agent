@@ -1195,6 +1195,62 @@ def _preserve_queued_followup_history_offset(
     return merged
 
 
+_CTX_WARN_DEFAULT_PCT = 0.75
+_CTX_WARN_MSG = (
+    "⚠️ 当前对话上下文已使用 {pct}%，继续对话可能导致压缩或精度下降。"
+    "建议发送 `/new` 开启新会话。"
+)
+
+
+async def _maybe_send_context_warn(
+    *,
+    runner,
+    session_entry,
+    agent_result: dict,
+    source,
+) -> None:
+    """Send a one-time context-length warning when usage crosses the threshold.
+
+    Reads compression.context_warn_pct from config.yaml (default 0.75).
+    The flag ctx_warn_sent on session_entry prevents repeated messages within
+    the same session; it resets naturally when reset_session() creates a new entry.
+    """
+    if session_entry.ctx_warn_sent:
+        return
+
+    last_tokens = agent_result.get("last_prompt_tokens") or 0
+    if last_tokens <= 0:
+        return
+    # Fallback to 200,000 when context_length is missing or 0 —
+    # matches the business default for all profiles that omit the config key.
+    ctx_length = agent_result.get("context_length") or 200_000
+
+    warn_pct = _CTX_WARN_DEFAULT_PCT
+    try:
+        cfg = _load_gateway_config()
+        warn_pct = float(
+            (cfg.get("compression") or {}).get("context_warn_pct", _CTX_WARN_DEFAULT_PCT)
+        )
+    except Exception:
+        pass
+
+    if last_tokens / ctx_length < warn_pct:
+        return
+
+    adapter = runner.adapters.get(source.platform)
+    if not adapter or not source.chat_id:
+        return
+
+    pct_int = int(last_tokens / ctx_length * 100)
+    msg = _CTX_WARN_MSG.format(pct=pct_int)
+    try:
+        await adapter.send(source.chat_id, msg)
+        runner.session_store.update_session(session_entry.session_key, ctx_warn_sent=True)
+        session_entry.ctx_warn_sent = True  # in-memory update so caller sees it
+    except Exception as _e:
+        logger.debug("ctx_warn send failed: %s", _e)
+
+
 class GatewayRunner:
     """
     Main gateway controller.
@@ -8158,6 +8214,15 @@ class GatewayRunner:
             self.session_store.update_session(
                 session_entry.session_key,
                 last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
+            )
+
+            # Context-length warning: send /new reminder once per session when usage
+            # crosses compression.context_warn_pct (default 75%).
+            await _maybe_send_context_warn(
+                runner=self,
+                session_entry=session_entry,
+                agent_result=agent_result,
+                source=source,
             )
 
             # Auto voice reply: send TTS audio before the text response

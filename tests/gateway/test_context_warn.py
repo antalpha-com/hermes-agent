@@ -22,13 +22,14 @@ from gateway.platforms.base import BasePlatformAdapter, SendResult
 # ---------------------------------------------------------------------------
 
 def _make_entry(**kwargs) -> SessionEntry:
-    return SessionEntry(
+    defaults = dict(
         session_key="sk-test",
         session_id="sid-test",
         created_at=datetime.now(),
         updated_at=datetime.now(),
-        **kwargs,
     )
+    defaults.update(kwargs)
+    return SessionEntry(**defaults)
 
 
 def _make_store(tmp_path) -> SessionStore:
