@@ -482,6 +482,10 @@ class SessionEntry:
     # Set by /stop to break stuck-resume loops (#7536).
     suspended: bool = False
 
+    # Set to True after a context-length warning has been sent for this session.
+    # Cleared automatically when reset_session() creates a new SessionEntry.
+    ctx_warn_sent: bool = False
+
     # When True the session was interrupted by a gateway restart/shutdown
     # drain timeout, but recovery is still expected.  Unlike ``suspended``,
     # ``resume_pending`` preserves the existing session_id on next access —
@@ -513,6 +517,7 @@ class SessionEntry:
             "cost_status": self.cost_status,
             "expiry_finalized": self.expiry_finalized,
             "suspended": self.suspended,
+            "ctx_warn_sent": self.ctx_warn_sent,
             "resume_pending": self.resume_pending,
             "resume_reason": self.resume_reason,
             "last_resume_marked_at": (
@@ -569,6 +574,7 @@ class SessionEntry:
             cost_status=data.get("cost_status", "unknown"),
             expiry_finalized=data.get("expiry_finalized", data.get("memory_flushed", False)),
             suspended=data.get("suspended", False),
+            ctx_warn_sent=data.get("ctx_warn_sent", False),
             resume_pending=data.get("resume_pending", False),
             resume_reason=data.get("resume_reason"),
             last_resume_marked_at=last_resume_marked_at,
