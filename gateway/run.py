@@ -1217,6 +1217,10 @@ async def _maybe_send_context_warn(
     the same session; it resets naturally when reset_session() creates a new entry.
     Replies in the same thread as the triggering message when applicable.
     """
+    logger.debug(
+        "ctx_warn check: session_key=%s ctx_warn_sent=%s",
+        session_entry.session_key, session_entry.ctx_warn_sent,
+    )
     if session_entry.ctx_warn_sent:
         return
 
@@ -1250,6 +1254,7 @@ async def _maybe_send_context_warn(
         await adapter.send(source.chat_id, msg, metadata=thread_meta)
         runner.session_store.update_session(session_entry.session_key, ctx_warn_sent=True)
         session_entry.ctx_warn_sent = True  # in-memory update so caller sees it
+        logger.info("ctx_warn sent: session_key=%s pct=%s%%", session_entry.session_key, pct_int)
     except Exception as _e:
         logger.debug("ctx_warn send failed: %s", _e)
 
