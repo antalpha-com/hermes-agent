@@ -967,6 +967,7 @@ class SessionStore:
         self,
         session_key: str,
         last_prompt_tokens: int = None,
+        ctx_warn_sent: bool = None,
     ) -> None:
         """Update lightweight session metadata after an interaction."""
         with self._lock:
@@ -977,6 +978,8 @@ class SessionStore:
                 entry.updated_at = _now()
                 if last_prompt_tokens is not None:
                     entry.last_prompt_tokens = last_prompt_tokens
+                if ctx_warn_sent is not None:
+                    entry.ctx_warn_sent = ctx_warn_sent
                 self._save()
 
     def suspend_session(self, session_key: str) -> bool:
