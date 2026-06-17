@@ -2180,6 +2180,7 @@ class SlackAdapter(BasePlatformAdapter):
                     TEXT_INJECT_EXTENSIONS = {
                         ".md", ".txt", ".csv", ".log", ".json", ".xml",
                         ".yaml", ".yml", ".toml", ".ini", ".cfg",
+                        ".html", ".htm",
                     }
                     if ext in TEXT_INJECT_EXTENSIONS and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
                         try:
