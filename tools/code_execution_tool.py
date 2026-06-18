@@ -660,6 +660,13 @@ def _get_or_create_env(task_id: str):
             host_cwd=config.get("host_cwd"),
         )
 
+        # docker-env-validate-patch: verify env vars were injected
+        if container_config:
+            from tools.terminal_tool import _validate_container_env
+            _validate_container_env(
+                env, env_type, container_config.get("docker_env", {})
+            )
+
         with _env_lock:
             _active_environments[effective_task_id] = env
             _last_activity[effective_task_id] = time.time()

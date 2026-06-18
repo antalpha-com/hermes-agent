@@ -1103,6 +1103,43 @@ def _get_modal_backend_state(modal_mode: object | None) -> Dict[str, Any]:
     )
 
 
+def _validate_container_env(env, env_type: str, expected_env: dict) -> None:
+    """docker-env-validate-patch: verify docker_env was injected into the new container.
+
+    Picks the first non-empty key from expected_env and checks it with printenv.
+    If missing, the container was built without -e flags (TERMINAL_DOCKER_ENV was
+    unset at gateway startup). Evicts the container and raises RuntimeError so the
+    caller propagates the error instead of caching a broken container.
+    """
+    if env_type != "docker" or not expected_env:
+        return
+    probe_key = next((k for k, v in expected_env.items() if v), None)
+    if probe_key is None:
+        return
+    try:
+        result = env.execute(f"printenv {probe_key}", timeout=5)
+        actual = result.get("output", "").strip()
+        if not actual:
+            logger.error(
+                "Container env injection failure: %s not set in new container. "
+                "TERMINAL_DOCKER_ENV was likely unset at gateway startup — "
+                "restart gateway to reload docker_env from config.yaml.",
+                probe_key,
+            )
+            try:
+                env.cleanup()
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"Container created without docker_env ({probe_key} missing). "
+                "Restart the gateway to reload config.yaml."
+            )
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        logger.debug("Could not validate container env (non-fatal): %s", exc)
+
+
 def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
                         ssh_config: dict = None, container_config: dict = None,
                         local_config: dict = None,
@@ -1880,6 +1917,12 @@ def terminal_tool(
                             "error": f"Terminal tool disabled: environment creation failed ({e})",
                             "status": "disabled"
                         }, ensure_ascii=False)
+
+                    # docker-env-validate-patch: verify env vars were injected
+                    if container_config:
+                        _validate_container_env(
+                            new_env, env_type, container_config.get("docker_env", {})
+                        )
 
                     with _env_lock:
                         _active_environments[effective_task_id] = new_env
