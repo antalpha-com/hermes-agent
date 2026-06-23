@@ -547,8 +547,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     # above it to the channel root and the part below as a threaded reply
     # under it. Only skills that emit this exact marker enter here, so all
     # other cron jobs fall through to the unchanged delivery below.
+    # Case-insensitive match so ===thread=== variants from the model also work.
     _TS_DELIM = "===THREAD==="
-    if _TS_DELIM in content:
+    import re as _re
+    _ts_match = _re.search(r'===thread===', content, _re.IGNORECASE)
+    if _ts_match:
         import asyncio as _aio
         import concurrent.futures as _cf
 
@@ -560,7 +563,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 with _cf.ThreadPoolExecutor(max_workers=1) as _pool:
                     return _pool.submit(_aio.run, _coro).result(timeout=60)
 
-        _summary, _details = (p.strip() for p in content.split(_TS_DELIM, 1))
+        _split_pos = _ts_match.start()
+        _split_end = _ts_match.end()
+        _summary, _details = content[:_split_pos].strip(), content[_split_end:].strip()
         _errs = []
         for _t in targets:
             try:
@@ -1338,6 +1343,16 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 if delivery_target.get("thread_id") is None
                 else str(delivery_target["thread_id"])
             )
+            # check_fn results are cached per-function for 30 s (global, not
+            # per-session).  deliver_report's check_fn reads a ContextVar that
+            # is only set here, so a prior non-cron call will have cached False.
+            # Invalidate now so the fresh ContextVar value is picked up when
+            # the agent's tool-list is built moments later.
+            try:
+                from tools.registry import invalidate_check_fn_cache
+                invalidate_check_fn_cache()
+            except Exception:
+                pass
 
         model = job.get("model") or os.getenv("HERMES_MODEL") or ""
 
@@ -1624,6 +1639,20 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # Strip leaked placeholder text that upstream may inject on empty completions.
         if final_response.strip() == "(No response generated)":
             final_response = ""
+
+        # If the deliver_report tool handled delivery during this run, suppress
+        # text-based delivery so the channel doesn't get a duplicate message.
+        try:
+            from tools.deliver_report_tool import _DELIVER_REPORT_SESSIONS
+            if _cron_session_id and _DELIVER_REPORT_SESSIONS.pop(_cron_session_id, False):
+                logger.info(
+                    "Job '%s': deliver_report tool handled delivery — suppressing text delivery",
+                    job_name,
+                )
+                final_response = SILENT_MARKER
+        except ImportError:
+            pass
+
         # Use a separate variable for log display; keep final_response clean
         # for delivery logic (empty response = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
