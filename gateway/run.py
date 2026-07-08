@@ -2651,6 +2651,16 @@ class GatewayRunner:
         merge_pending_message_event(adapter._pending_messages, session_key, event)
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
+        # --- pre_gateway_dispatch hook ---
+        # The busy path queues the event (or injects it via interrupt/steer)
+        # without ever reaching _handle_message, so the hook must also run
+        # here or plugins never see messages that arrive while a turn is
+        # running.  Same before-auth placement as the cold path.
+        _dispatched_event = self._apply_pre_gateway_dispatch(event)
+        if _dispatched_event is None:
+            return True  # plugin claimed the message; drop silently
+        event = _dispatched_event
+
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
         # creating a session.  The busy path must enforce the same check;
@@ -5957,6 +5967,62 @@ class GatewayRunner:
 
         await adapter.send(source.chat_id, content, metadata=metadata)
 
+    def _apply_pre_gateway_dispatch(self, event: MessageEvent) -> Optional[MessageEvent]:
+        """Run the pre_gateway_dispatch plugin hook on a user-originated event.
+
+        Plugins may return a dict influencing flow:
+          {"action": "skip",    "reason": ...}  -> drop (return None)
+          {"action": "rewrite", "text":  ...}   -> replace event.text
+          {"action": "allow"}   /   None        -> pass through unchanged
+
+        Returns the (possibly rewritten) event, or None when a plugin claimed
+        the message.  Internal (synthetic) events bypass the hook.  Runs
+        BEFORE auth so plugins can handle unauthorized senders (e.g. customer
+        handover ingest) without triggering the pairing flow.
+
+        Called from BOTH dispatch paths: _handle_message (agent idle) and
+        _handle_active_session_busy_message (agent running).  The busy path
+        queues the event for the next turn without ever reaching
+        _handle_message, so skipping it there meant plugins never saw
+        messages that arrived mid-turn (2026-07-08: a Slack button click
+        "EMAIL_CONFIRM:<nonce>" bypassed the email-confirm-guard rewrite).
+        """
+        if getattr(event, "internal", False):
+            return event
+        try:
+            from hermes_cli.plugins import invoke_hook as _invoke_hook
+            _hook_results = _invoke_hook(
+                "pre_gateway_dispatch",
+                event=event,
+                gateway=self,
+                session_store=self.session_store,
+            )
+        except Exception as _hook_exc:
+            logger.warning("pre_gateway_dispatch invocation failed: %s", _hook_exc)
+            return event
+
+        source = event.source
+        for _result in _hook_results:
+            if not isinstance(_result, dict):
+                continue
+            _action = _result.get("action")
+            if _action == "skip":
+                logger.info(
+                    "pre_gateway_dispatch skip: reason=%s platform=%s chat=%s",
+                    _result.get("reason"),
+                    source.platform.value if source and source.platform else "unknown",
+                    (source.chat_id if source else None) or "unknown",
+                )
+                return None
+            if _action == "rewrite":
+                _new_text = _result.get("text")
+                if isinstance(_new_text, str):
+                    event = dataclasses.replace(event, text=_new_text)
+                break
+            if _action == "allow":
+                break
+        return event
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -5976,46 +6042,14 @@ class GatewayRunner:
         # are system-generated and must skip user authorization.
         is_internal = bool(getattr(event, "internal", False))
 
-        # Fire pre_gateway_dispatch plugin hook for user-originated messages.
-        # Plugins receive the MessageEvent and may return a dict influencing flow:
-        #   {"action": "skip",    "reason": ...}    -> drop (no reply, plugin handled)
-        #   {"action": "rewrite", "text":  ...}     -> replace event.text, continue
-        #   {"action": "allow"}   /   None          -> normal dispatch
-        # Hook runs BEFORE auth so plugins can handle unauthorized senders
-        # (e.g. customer handover ingest) without triggering the pairing flow.
+        # Fire pre_gateway_dispatch plugin hook for user-originated messages
+        # (see _apply_pre_gateway_dispatch for the action contract).
         if not is_internal:
-            try:
-                from hermes_cli.plugins import invoke_hook as _invoke_hook
-                _hook_results = _invoke_hook(
-                    "pre_gateway_dispatch",
-                    event=event,
-                    gateway=self,
-                    session_store=self.session_store,
-                )
-            except Exception as _hook_exc:
-                logger.warning("pre_gateway_dispatch invocation failed: %s", _hook_exc)
-                _hook_results = []
-
-            for _result in _hook_results:
-                if not isinstance(_result, dict):
-                    continue
-                _action = _result.get("action")
-                if _action == "skip":
-                    logger.info(
-                        "pre_gateway_dispatch skip: reason=%s platform=%s chat=%s",
-                        _result.get("reason"),
-                        source.platform.value if source.platform else "unknown",
-                        source.chat_id or "unknown",
-                    )
-                    return None
-                if _action == "rewrite":
-                    _new_text = _result.get("text")
-                    if isinstance(_new_text, str):
-                        event = dataclasses.replace(event, text=_new_text)
-                        source = event.source
-                    break
-                if _action == "allow":
-                    break
+            _dispatched_event = self._apply_pre_gateway_dispatch(event)
+            if _dispatched_event is None:
+                return None
+            event = _dispatched_event
+            source = event.source
 
         if is_internal:
             pass
@@ -7102,7 +7136,17 @@ class GatewayRunner:
         )
         if _is_shared_multi_user and source.user_name:
             _sender_label = f"{source.user_name} (ID: {source.user_id})" if source.user_id else source.user_name
-            message_text = f"[{_sender_label}] {message_text}"
+            # Slack only: channel attribution as a SEPARATE bracket block —
+            # downstream skills parse the sender block with
+            # `\[.+ \(ID: (U[A-Z0-9]+)\)\]`, so the channel id must not be
+            # appended inside that block.  parent_chat_id wins when chat_id
+            # refers to a thread.
+            _channel_block = ""
+            if source.platform == Platform.SLACK:
+                _channel_id = source.parent_chat_id or source.chat_id
+                if _channel_id:
+                    _channel_block = f" [Channel: {_channel_id}]"
+            message_text = f"[{_sender_label}]{_channel_block} {message_text}"
 
         # Prepend channel context from history backfill (if any).  This
         # happens after sender-prefix so the prefix only applies to the

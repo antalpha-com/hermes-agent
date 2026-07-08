@@ -177,3 +177,131 @@ async def test_internal_events_bypass_hook(monkeypatch):
     # Even though the hook would say skip, internal events bypass it.
     await runner._handle_message(event)
     assert called["count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Busy path (_handle_active_session_busy_message)
+#
+# Messages arriving while a turn is running are queued/interrupt-injected and
+# never reach _handle_message, so the hook must also run at the busy-path
+# entry.  Incident 2026-07-08: a Slack button click ("EMAIL_CONFIRM:<nonce>")
+# landed mid-turn and bypassed the email-confirm-guard rewrite entirely.
+# ---------------------------------------------------------------------------
+
+
+def _make_busy_runner(platform: Platform):
+    from gateway.run import GatewayRunner
+
+    config = GatewayConfig(
+        platforms={platform: PlatformConfig(enabled=True)},
+    )
+    runner = object.__new__(GatewayRunner)
+    runner.config = config
+    adapter = SimpleNamespace(
+        send=AsyncMock(),
+        _send_with_retry=AsyncMock(),
+        _pending_messages={},
+    )
+    runner.adapters = {platform: adapter}
+    runner.session_store = MagicMock()
+    runner._draining = False
+    runner._busy_ack_ts = {}
+    runner._is_user_authorized = MagicMock(return_value=True)
+    running_agent = MagicMock()
+    runner._running_agents = {"sess1": running_agent}
+    return runner, adapter, running_agent
+
+
+@pytest.mark.asyncio
+async def test_busy_path_rewrite_replaces_queued_text(monkeypatch):
+    """A rewrite from the hook must land in the queued event AND the interrupt."""
+    monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")
+
+    def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            return [{"action": "rewrite", "text": "REWRITTEN"}]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+
+    runner, adapter, running_agent = _make_busy_runner(Platform.WHATSAPP)
+
+    handled = await runner._handle_active_session_busy_message(
+        _make_event("EMAIL_CONFIRM:abc"), "sess1"
+    )
+
+    assert handled is True
+    queued = adapter._pending_messages.get("sess1")
+    assert queued is not None and queued.text == "REWRITTEN"
+    running_agent.interrupt.assert_called_once_with("REWRITTEN")
+
+
+@pytest.mark.asyncio
+async def test_busy_path_skip_drops_message(monkeypatch):
+    """A skip from the hook drops the message: nothing queued, no interrupt."""
+    monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")
+
+    def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            return [{"action": "skip", "reason": "stale nonce"}]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+
+    runner, adapter, running_agent = _make_busy_runner(Platform.WHATSAPP)
+
+    handled = await runner._handle_active_session_busy_message(
+        _make_event("EMAIL_CONFIRM:stale"), "sess1"
+    )
+
+    assert handled is True
+    assert adapter._pending_messages == {}
+    running_agent.interrupt.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_busy_path_internal_event_bypasses_hook(monkeypatch):
+    """Internal events skip the hook on the busy path too."""
+    monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")
+
+    called = {"count": 0}
+
+    def _fake_hook(name, **kwargs):
+        called["count"] += 1
+        return [{"action": "skip"}]
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+
+    runner, adapter, running_agent = _make_busy_runner(Platform.WHATSAPP)
+
+    event = _make_event("bg done")
+    event.internal = True
+    handled = await runner._handle_active_session_busy_message(event, "sess1")
+
+    assert handled is True
+    assert called["count"] == 0
+    queued = adapter._pending_messages.get("sess1")
+    assert queued is not None and queued.text == "bg done"
+    running_agent.interrupt.assert_called_once_with("bg done")
+
+
+@pytest.mark.asyncio
+async def test_busy_path_hook_exception_falls_through(monkeypatch):
+    """A raising hook must not break the busy path — original text is queued."""
+    monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")
+
+    def _fake_hook(name, **kwargs):
+        raise RuntimeError("plugin blew up")
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+
+    runner, adapter, running_agent = _make_busy_runner(Platform.WHATSAPP)
+
+    handled = await runner._handle_active_session_busy_message(
+        _make_event("hello"), "sess1"
+    )
+
+    assert handled is True
+    queued = adapter._pending_messages.get("sess1")
+    assert queued is not None and queued.text == "hello"
+    running_agent.interrupt.assert_called_once_with("hello")

@@ -2434,17 +2434,6 @@ class SlackAdapter(BasePlatformAdapter):
         user_name = body.get("user", {}).get("name", "unknown")
         user_id = body.get("user", {}).get("id", "")
 
-        # Authorization — reuse the exec-approval allowlist.
-        allowed_csv = os.getenv("SLACK_ALLOWED_USERS", "").strip()
-        if allowed_csv:
-            allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
-            if "*" not in allowed_ids and user_id not in allowed_ids:
-                logger.warning(
-                    "[Slack] Unauthorized slash-confirm click by %s (%s) — ignoring",
-                    user_name, user_id,
-                )
-                return
-
         # Parse session_key|confirm_id back out
         if "|" not in value:
             logger.warning("[Slack] Malformed slash-confirm value: %s", value)
@@ -2531,19 +2520,6 @@ class SlackAdapter(BasePlatformAdapter):
         channel_id = body.get("channel", {}).get("id", "")
         user_name = body.get("user", {}).get("name", "unknown")
         user_id = body.get("user", {}).get("id", "")
-
-        # Only authorized users may click approval buttons.  Button clicks
-        # bypass the normal message auth flow in gateway/run.py, so we must
-        # check here as well.
-        allowed_csv = os.getenv("SLACK_ALLOWED_USERS", "").strip()
-        if allowed_csv:
-            allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
-            if "*" not in allowed_ids and user_id not in allowed_ids:
-                logger.warning(
-                    "[Slack] Unauthorized approval click by %s (%s) — ignoring",
-                    user_name, user_id,
-                )
-                return
 
         # Map action_id to approval choice
         choice_map = {
@@ -2642,18 +2618,6 @@ class SlackAdapter(BasePlatformAdapter):
             if len(self._button_clicked) > 5000:
                 for old in list(self._button_clicked)[:2500]:
                     self._button_clicked.discard(old)
-
-        # Authorize the clicker.  Button clicks bypass the normal inbound auth
-        # flow, so enforce SLACK_ALLOWED_USERS here too (mirrors approvals).
-        allowed_csv = os.getenv("SLACK_ALLOWED_USERS", "").strip()
-        if allowed_csv:
-            allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
-            if "*" not in allowed_ids and user_id not in allowed_ids:
-                logger.warning(
-                    "[Slack] Unauthorized button click by %s (%s) — ignoring",
-                    user_name, user_id,
-                )
-                return
 
         # button-callbacks-patch: typed-callback short-circuit
         # If the button value encodes a cb: callback, handle it
