@@ -2287,6 +2287,34 @@ async def _connect_server(name: str, config: dict) -> MCPServerTask:
 # Handler / check-fn factories
 # ---------------------------------------------------------------------------
 
+_CONTAINER_PATH_PREFIXES = ("/workspace/", "/root/")
+
+
+def _remap_mcp_arg_paths(value):
+    """Recursively remap container-internal paths in MCP tool arguments.
+
+    MCP servers (email, drive, etc.) run on the host, not inside the Docker
+    sandbox, so a container path like ``/workspace/outbound/report.xlsx`` the
+    model wrote to is meaningless to them — every such call fails with a
+    literal "file not found", regardless of whether the file actually exists
+    (2026-07-16, bi-intern: every attachment path, including the "safe"
+    /workspace one, failed this way). ``remap_container_path_to_host`` already
+    solves the identical problem for send_message/MEDIA delivery; apply it
+    here too instead of leaving MCP tool calls as the one path that never
+    got the fix.
+    """
+    if isinstance(value, str):
+        if value.startswith(_CONTAINER_PATH_PREFIXES):
+            from tools.environments.base import remap_container_path_to_host
+            return remap_container_path_to_host(value)
+        return value
+    if isinstance(value, list):
+        return [_remap_mcp_arg_paths(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _remap_mcp_arg_paths(v) for k, v in value.items()}
+    return value
+
+
 def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """Return a sync handler that calls an MCP tool via the background loop.
 
@@ -2329,9 +2357,11 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 "error": f"MCP server '{server_name}' is not connected"
             }, ensure_ascii=False)
 
+        remapped_args = _remap_mcp_arg_paths(args)
+
         async def _call():
             async with server._rpc_lock:
-                result = await server.session.call_tool(tool_name, arguments=args)
+                result = await server.session.call_tool(tool_name, arguments=remapped_args)
             # MCP CallToolResult has .content (list of content blocks) and .isError
             if result.isError:
                 error_text = ""
