@@ -262,6 +262,12 @@ _DEFAULT_CONNECT_TIMEOUT = 60    # seconds for initial connection per server
 _MAX_RECONNECT_RETRIES = 5
 _MAX_INITIAL_CONNECT_RETRIES = 3 # retries for the very first connection attempt
 _MAX_BACKOFF_SECONDS = 60
+# How long a session must stay up before it counts as proof the server is
+# viable.  Reaching this clears the reconnect budget, so _MAX_RECONNECT_RETRIES
+# bounds one outage rather than the whole process lifetime.  Comfortably above
+# the 30s keepalive RPC timeout, and far above the sub-second window a
+# connect-crash loop dies in — those keep accumulating and still hit the cap.
+_STABLE_SESSION_SECONDS = 60
 
 # Environment variables that are safe to pass to stdio subprocesses
 _SAFE_ENV_KEYS = frozenset({
@@ -1025,7 +1031,7 @@ class MCPServerTask:
         "_tools", "_error", "_config",
         "_sampling", "_registered_tool_names", "_auth_type", "_refresh_lock",
         "_rpc_lock", "_pending_refresh_tasks",
-        "initialize_result",
+        "initialize_result", "_connected_at",
     )
 
     def __init__(self, name: str):
@@ -1034,6 +1040,10 @@ class MCPServerTask:
         self.tool_timeout: float = _DEFAULT_TOOL_TIMEOUT
         self._task: Optional[asyncio.Task] = None
         self._ready = asyncio.Event()
+        # Monotonic stamp of the last successful session establishment, or
+        # None while no session is up. run() reads it to tell a recovered
+        # outage apart from a connect-crash loop.
+        self._connected_at: Optional[float] = None
         self._shutdown_event = asyncio.Event()
         # Set by tool handlers on auth failure after manager.handle_401()
         # confirms recovery is viable. When set, _run_http / _run_stdio
@@ -1066,6 +1076,17 @@ class MCPServerTask:
     def _is_http(self) -> bool:
         """Check if this server uses HTTP transport."""
         return "url" in self._config
+
+    def _mark_session_ready(self) -> None:
+        """Record a live session and unblock everyone waiting on ``_ready``.
+
+        Call this — never ``_ready.set()`` directly — from the transport
+        runners once ``initialize()`` and tool discovery have both succeeded.
+        The stamp is what lets :meth:`run` credit uptime when the session
+        later drops.
+        """
+        self._connected_at = time.monotonic()
+        self._ready.set()
 
     # ----- Dynamic tool discovery (notifications/tools/list_changed) -----
 
@@ -1311,7 +1332,7 @@ class MCPServerTask:
                     self.initialize_result = await session.initialize()
                     self.session = session
                     await self._discover_tools()
-                    self._ready.set()
+                    self._mark_session_ready()
                     # stdio transport does not use OAuth, but we still honor
                     # _reconnect_event (e.g. future manual /mcp refresh) for
                     # consistency with _run_http.
@@ -1411,7 +1432,7 @@ class MCPServerTask:
                     self.initialize_result = await session.initialize()
                     self.session = session
                     await self._discover_tools()
-                    self._ready.set()
+                    self._mark_session_ready()
                     reason = await self._wait_for_lifecycle_event()
                     if reason == "reconnect":
                         logger.info(
@@ -1458,7 +1479,7 @@ class MCPServerTask:
                         self.initialize_result = await session.initialize()
                         self.session = session
                         await self._discover_tools()
-                        self._ready.set()
+                        self._mark_session_ready()
                         reason = await self._wait_for_lifecycle_event()
                         if reason == "reconnect":
                             logger.info(
@@ -1481,7 +1502,7 @@ class MCPServerTask:
                     self.initialize_result = await session.initialize()
                     self.session = session
                     await self._discover_tools()
-                    self._ready.set()
+                    self._mark_session_ready()
                     reason = await self._wait_for_lifecycle_event()
                     if reason == "reconnect":
                         logger.info(
@@ -1635,6 +1656,28 @@ class MCPServerTask:
                     )
                     return
 
+                # A session that stayed up long enough to prove the server
+                # viable earns a fresh budget. Without this, ``retries`` is a
+                # per-process lifetime allowance: five unrelated blips days
+                # apart — each recovered in seconds, with hundreds of good
+                # calls in between — exhaust it, and the next drop kills the
+                # server until the gateway restarts. Sessions that die on
+                # arrival never reach the threshold, so a genuine
+                # connect-crash loop still accumulates and hits the cap.
+                uptime = (
+                    None if self._connected_at is None
+                    else time.monotonic() - self._connected_at
+                )
+                if uptime is not None and uptime >= _STABLE_SESSION_SECONDS:
+                    if retries:
+                        logger.info(
+                            "MCP server '%s': session held for %.0fs before "
+                            "dropping — resetting reconnect budget (was %d/%d)",
+                            self.name, uptime, retries, _MAX_RECONNECT_RETRIES,
+                        )
+                    retries = 0
+                    backoff = 1.0
+
                 retries += 1
                 if retries > _MAX_RECONNECT_RETRIES:
                     logger.warning(
@@ -1658,6 +1701,9 @@ class MCPServerTask:
                     return
             finally:
                 self.session = None
+                # Drop the stamp with the session it belongs to, so the next
+                # attempt cannot claim uptime it never had.
+                self._connected_at = None
 
     async def start(self, config: dict):
         """Create the background Task and wait until ready (or failed)."""
@@ -1753,6 +1799,65 @@ def _reset_server_error(server_name: str) -> None:
     """
     _server_error_counts[server_name] = 0
     _server_breaker_opened_at.pop(server_name, None)
+
+
+# Monotonic stamp of the last revival attempt per server, so a burst of tool
+# calls against a dead task schedules at most one restart per cooldown.
+_server_revived_at: Dict[str, float] = {}
+
+
+def _revive_dead_server(server_name: str) -> bool:
+    """Restart a server task whose reconnect loop exited for good.
+
+    ``MCPServerTask.run()`` returns permanently once a connect-crash loop
+    burns through the reconnect budget. Nothing used to re-enter it, so every
+    later tool call failed instantly with "is not connected" — while the
+    circuit breaker went on promising an auto-retry it had no way to deliver
+    (all it re-armed was ``_reconnect_event``, and the task listening for it
+    was already gone). Only a gateway restart brought the server back.
+
+    Re-arming the task here makes that self-healing: the breaker cooldown
+    paces the attempts, and a server that is still down simply exhausts a
+    fresh budget and exits again, ready for the next attempt one cooldown
+    later.
+
+    Returns True when a restart was scheduled. Safe to call on every
+    "not connected" miss — unknown, live, and deliberately stopped servers
+    are all no-ops.
+    """
+    with _lock:
+        srv = _servers.get(server_name)
+        loop = _mcp_loop
+    if srv is None or loop is None or not loop.is_running():
+        return False
+    task = srv._task
+    # Never started (start() owns that) or still running — nothing to revive.
+    if task is None or not task.done():
+        return False
+    if srv._shutdown_event.is_set():
+        return False
+
+    now = time.monotonic()
+    if now - _server_revived_at.get(server_name, 0.0) < _CIRCUIT_BREAKER_COOLDOWN_SEC:
+        return False
+    _server_revived_at[server_name] = now
+
+    def _restart():
+        # Re-check on the loop thread: another caller may have won the race.
+        if srv._task is not None and not srv._task.done():
+            return
+        if srv._shutdown_event.is_set():
+            return
+        srv._ready.clear()
+        srv._error = None
+        srv._task = asyncio.ensure_future(srv.run(srv._config))
+
+    loop.call_soon_threadsafe(_restart)
+    logger.warning(
+        "MCP server '%s': reconnect loop had exited — restarting it",
+        server_name,
+    )
+    return True
 
 # ---------------------------------------------------------------------------
 # Auth-failure detection helpers (Task 6 of MCP OAuth consolidation)
@@ -2353,6 +2458,10 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             server = _servers.get(server_name)
         if not server or not server.session:
             _bump_server_error(server_name)
+            # If the reconnect loop exited for good, re-arm it so the
+            # cooldown the message advertises can actually deliver. The
+            # restart is async, so this call still reports the miss.
+            _revive_dead_server(server_name)
             return json.dumps({
                 "error": f"MCP server '{server_name}' is not connected"
             }, ensure_ascii=False)
